@@ -8,3 +8,5 @@ train trumpet signals to get trumpet.tf
 input sax_original.wav&trumpet.tf
 
 output sax2trumpet.wav
+
+raw code: send email to 13333312299@163.com
