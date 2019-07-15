@@ -17,11 +17,11 @@ Example
 
 ●	program command: tfsynth.fa0
 
-●	input: transfer function(spectral envelope) data--trumpet.tf
+●	input: transfer function(spectral envelope) data--trumpet.tf;
 
-       input signal analysis file--leonard.16.nik.mq.an
+input signal analysis file--leonard.16.nik.mq.an
        
-●	output: resynthesized sound signal--leonard.test.wav
+●	output: resynthesized sound signal--leonard.test.wav;
 
-      resynthesized analysis file(optional)--leonard.test.an
+resynthesized analysis file(optional)--leonard.test.an
 
