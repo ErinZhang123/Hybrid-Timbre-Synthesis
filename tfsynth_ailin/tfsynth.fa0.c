@@ -1,0 +1,739 @@
+/******************************************************************************
+			tfsynth.fa0.c
+middle of the band   code not needed
+
+PURPOSE: Program to synthesize sound file given a transfer function (.tf) file
+	and an analysis (.an) file containing rms, BR, and dfr information.
+	This version uses the instantaneous frequency (fr = fa + dfr[i*nhar1])
+	as well as the instantaneous centroid ((BR-1)*fr) of the analysis file
+	to retrieve harmonic amplitude data from spectrum envelopes stored in
+	the .tf file. It is useful for applications where dfr is used to
+	store large variations in fundamental frequency and fa==0, but it will
+	also work for applications where dfr is small and fa is a constant
+	fundamental frequency. The RMS amplitude of the analysis file is also
+	preserved in the output sound file. Synthesis is done by standard
+	time-variant additive synthesis.
+
+PROGRAMMER: James Beauchamp (after Andrew Horner)
+
+ORIGINAL DATE: March 29, 1997
+
+LATEST EDIT: July 21, 2008
+
+FILES NEEDED TO CREATE EXECUTABLE:
+  tfsynth.fa0.c, anread.c, header.c, header.h, monan.h, macro.h,
+  sndhdr.c, sndhdr.h, wavhdr.c, wavhdr.h
+
+COMPILATION: cc -o tfsynth.fa0 tfsynth.fa0.c anread.c sndhdr.c wavhdr.c -lm
+
+EXECUTION: tfsynth.fa0 [file.tf [ file.an [ outfile.snd ] ] ]
+
+Changes:
+ 05/29/08: jwb	synthesizeTone(): variable fac changed to pfac.
+ 05/30/08: jwb	synthesizeTone(): enable modified analysis file write.
+ 06/01/08: jwb	addsyn(): restrict number of harmonics to prevent aliasing.
+ 06/02/08: jwb	haramp(): restrict harmonic sampling of spectral envelopes
+		to frequencies below the highest band frequency.
+ 06/07/08: jwb	haramp(): change tffac & ffac to tffrac & ffrac for better
+		mnemonics.
+ 06/08/08: jwb	synthesizeTone(): change p definition for better consistency.
+ 06/09/08: jwb	synthesizeTone(): introduce interpolation between bands
+		for computing spectrum envelope centroids at particular F0s.
+ 06/19/08: jwb	Overall: improve printouts.
+ 07/09/08: jwb	Cosmetics
+ 07/11/08: jwb	synthesizeTone(): comment out printouts.
+		For linux installation:
+		addsynth(): Install byte reversal code
+ 07/21/08: jwb	Eliminate including C external files and use compilation
+		linking extern variables to object files instead. Install
+		includes macro.h, header.h byteorder.h, sndhdr.h, wavhdr.h,
+		as well as global variables.
+ 08/14/08: jwb  tfRead(): Correct specenv array allocation size problem.
+		getfiltype(): Install to get sound file type (snd or wav)
+		from suffix extension. Also, install SND and WAV defines
+		and the global array 'tail'.
+		main(): Install filetype variable and code for determining
+		filetype of output sample file. Also, install byte_reverse
+		variable and code for determining byte_reverse, which is
+		used in addsynth() in case byte reversal is needed.
+		getout(): Install for getting out if output file suffix is
+		not recognized.
+		addsynth(): SR is replaced by fs, which is obtained from
+		analysis file header.
+08/17/18 a.z  Change specenv, specenv[0~numFreqBands-1] reserved for
+                  spectral envelope centroid=0;
+                  tfRead(): Change the size of specenv and specenv data
+                  storage so that specenv[i*numFreqBands + j] stores
+                  amplitude of spectral envelope i at frequency band j;
+                  specenv[0]-specenv[numFreqBands-1] is reserved for spectral
+                  envelope centroid=0.
+  		synthesizeTone(): centroidTF is computed on the fly instead
+                  of being computed ahead for each pitch. Change fr, fr=freq[i];
+      		Add rescaleFac.
+  		haramp(): handle case when frk is lower than min freq in
+  		frBandmin.
+      		Correct sum1 and sum2 initialization to be at the right place
+08/27/18 a.z synthesizeTone(): compute centroid and rms at each frame only
+               using harmonics whose frequencies are below the maximum frequency
+               of spec. env. frequency bands.
+ *****************************************************************************/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+#include <strings.h>
+#include "macro.h"					    /* jwb 07/21/08 */
+#include "header.h"					    /* jwb 07/21/08 */
+#include "byteorder.h"                                      /* jwb 07/21/08 */
+#include "sndhdr.h"                                         /* jwb 07/21/08 */
+#include "wavhdr.h"       				    /* jwb 07/21/08 */
+
+#define P printf
+#define FUN_LENGTH 4096
+#define FUN_LEN1   4097
+#define SND 0						    /* jwb 08/14/08 */
+#define WAV 1						    /* jwb 08/14/08 */
+#define MAXFTYPES 2					    /* jwb 08/14/08 */
+#define BUFSIZE 80
+/* global variables explain  a.z 08/17/18 */
+/*
+nhar: number of harmonics, obtained from anread; nhar1=nhar+1
+npts: number of frames, obtained from anread
+cmag: cmag[i*nhar1+k]----amplitude value of harmonic k frame i
+      cmag[i*nhar1]----rms amplitude of frame i
+
+fa:   fixed analysis fundamental frequency for *.pv.an file;
+      set to zero for *.mq.an file.
+dfr:  dfr[i*nhar1]----f0 frequency deviation from fa for frame i for *.pv.an
+      file. Contains total f0 frequency for *.mq.an file.
+br:   br[i]---- normalized centroid ("brightness") of frame i
+rms: rms[i]= cmag[i*nhar1]---- rms amplitude at frame i.
+numTFs: number of spectral envelopes in *.tf file and specenv array.
+numFreqBands: number of spectral envelope frequency bands
+specenv: specenv[j+h*numFreqBands]----amplitude of spectral envelope h
+         at frequency band j .
+         specenv[0]-specenv[numFreqBands-1] reserved
+         for spectral envelope centroid=0;
+frBandmid: average of adjacent band minimum frequencies.
+freq[i]----fund freq of frame i: freq[i] = frfac*(fa + dfr[i*nhar1]),
+      where frfac is the fund freq transpose factor.
+centroidTF:centroidTF[h+i*numTFs]----centroid value of spectral envelope h,
+            based on freq[i], for h=0 to numTFs-1 . centroidTF[0]=0;
+centroid[i]----centroid value for each frame i of input analysis file.
+            centroid[i] = (br[i] - 1.)*freq[i];
+tfVal: tfVal[i]----spectral envelope number matching centroid[i]
+rescaleFac: input analysis file centroid rescale factor, used when max input
+      centroid is greater than the minimum of centroidTF[numTFs] in all frames
+*/
+HEADER header;						    /* jwb 07/21/08 */
+int nhar, nhar1, npts;					    /* jwb 07/21/08 */
+float *cmag, *dfr, *phase, *br, dt, tl, smax, fs, fa;	    /* jwb 07/21/08 */
+char *tail[MAXFTYPES] = {"snd","wav"};			    /* jwb 08/14/08 */
+int byte_reverse;					    /* jwb 08/14/08 */
+
+int numTFs, numFreqBands;				    /* jwb 06/08/08 */
+int brmatch;  /* brmatch=0 means expected centroid values are used.
+              /* brmatch=1 means centroid of analysis file is matched
+                 against TF centroids using st. line formula.
+                 brmatch=2 means centroid is matched by interpolation
+                 between TFs with straddling centroids. */
+int br_rms_link; /* =1 means that centroid and rms are linked by formula */
+int freqBandWidth; /* width of linear bands */
+float *specenv, *frBandmid, *freq, *centroidTF, *centroid, *tfVal, *rms;
+float CentMax, F0, F1, A0, A1, A2,rescaleFac;
+static char buffer[BUFSIZE];
+/* global function definitions */
+void setupLinFreqBands(), setupCBFreqBands(), synthesizeTone(int );
+void tfRead(FILE*), addsynth(int), haramp();
+int fbandno(float );
+int getfiltype(char*);					    /* jwb 08/14/08 */
+
+main(int argc, char **argv)
+{
+  int sffd, i;
+  FILE *afd, *tfd;
+  char resp[10], tfFile[100], anfile[100], sfile[100], instru[20];
+  int filetype, nsamps;					    /* jwb 08/14/08 */
+
+/* read transfer function (tf) file */
+  if(argc >= 2)
+  {
+    strcpy(tfFile,argv[1]);
+    tfd = fopen(tfFile, "r");
+    if(tfd == NULL)
+    {
+      P("Cannot read file %s\n", argv[1]);
+      exit(1);
+    }
+  }
+  else
+  {
+    tfd = NULL;
+    while(tfd == NULL)
+    {
+      P("Enter the name of the transfer function file: ");
+      scanf(" %s", tfFile);
+      P("\n");						    /* jwb 06/19/08 */
+      tfd = fopen(tfFile, "r");
+      if(tfd == NULL)
+        P("File not found, reenter. \n");
+    }
+  }
+  tfRead(tfd);
+
+  if(argc >= 3)
+  {
+    strcpy(anfile,argv[2]);
+    afd = fopen(anfile, "r");
+    if(afd == NULL)
+    {
+      P("Cannot read file %s\n", anfile);
+      exit(1);
+    }
+  }
+  else
+  {
+    afd = NULL;
+    while(afd == NULL)
+    {
+      P("Enter the name of the input analysis file: ");
+      scanf(" %s", anfile);
+      P("\n");						    /* jwb 06/19/08 */
+      afd = fopen(anfile, "r");
+      if(afd == NULL)
+        P("File not found, reenter. \n");
+    }
+  }
+  fclose(afd);
+
+  anread(anfile);
+  fs = header.sr;                                           /* jwb 08/14/08 */
+
+/* determine and initialize output sample file */
+  if(argc >= 4)
+  {
+    strcpy(sfile,argv[3]);
+    sffd = creat(sfile, 0644);
+    if(sffd == -1)
+    {
+      P("Cannot write output file %s\n", sfile);
+      exit(1);
+    }
+  }
+  else
+  {
+    sffd = -1;
+    while(sffd == -1)
+    {
+      P("\nEnter the name of the output sound file: ");
+      scanf("%s%*c", sfile);
+      P("\n");						    /* jwb 06/19/08 */
+      if((sffd = open(sfile,0)) != -1)
+      {
+        close(sffd);
+	P("Outfile file already exists! Do you wish to overwrite it?(y/n) ");
+        scanf("%s%*c",resp);
+        if(resp[0] == 'n') continue;
+      }
+      sffd = creat(sfile, 0644);
+      if(sffd == -1)
+        P("Cannot write output file %s\n", sfile);
+    }
+  } /* end else */
+
+/*  determine output file type  */
+  filetype = getfiltype(sfile);				    /* jwb 08/14/08 */
+  P("filetype = %d\n", filetype);
+  if(filetype == MAXFTYPES) getout();                       /* jwb 08/14/08 */
+  nsamps = tl*fs;					    /* jwb 08/14/08 */
+  if(filetype == SND)                                       /* jwb 08/14/08 */
+  {							    /* jwb 08/14/08 */
+/*  create next header */
+    writeSndHdr(sffd,(int)fs,1,nsamps,SND_FORMAT_LINEAR_16);/* jwb 08/14/08 */
+    P("write SND sound file header\n\n");		    /* jwb 08/14/08 */
+/* SND data is big-endian, so if the host is little-endian,
+   byte-reverse the data. */
+    byte_reverse = (byte_order() != big_endian);            /* jwb 08/14/08 */
+  }							    /* jwb 08/14/08 */
+  else if (filetype == WAV)				    /* jwb 08/14/08 */
+  {							    /* jwb 08/14/08 */
+    writeWavHdr(sffd, (int)fs, 1, nsamps, 16);		    /* jwb 08/14/08 */
+    P("write WAV sound file header\n\n");		    /* jwb 08/14/08 */
+    /* WAV data is little-endian, so if the host is big-endian,
+       byte-reverse the data. */
+    byte_reverse = (byte_order() != little_endian);         /* jwb 08/14/08 */
+  }							    /* jwb 08/14/08 */
+  else getout();					    /* jwb 08/14/08 */
+  P("output sample rate is %.0f Hz\n\n", fs);		    /* jwb 08/14/08 */
+
+/* write output sound file */
+  synthesizeTone(sffd);
+
+  P("Write output sound file %s\n\n", sfile);
+
+}  /*  end main()  */
+
+/*****************************************************************************/
+void tfRead(FILE *pfd)
+{
+  float *tPEAK, *ttl, *tdt, *tfa;
+  int Nfiles, i, j, k, *tnpts, criticalBandModel;
+
+  fscanf(pfd, "%d", &Nfiles);
+  tfa = (float *) malloc(Nfiles*sizeof(float));
+  ttl = (float *) malloc(Nfiles*sizeof(float));
+  tdt = (float *) malloc(Nfiles*sizeof(float));
+  tnpts = (int *) malloc(Nfiles*sizeof(int));
+  tPEAK = (float *) malloc(Nfiles*sizeof(float));
+  /* read basic data from .tf file. not really needed, but oh well  */
+  for(i=0; i<Nfiles; i++) fscanf(pfd, "%f %f %f %d %f\n",
+               &tfa[i], &ttl[i], &tdt[i], &tnpts[i], &tPEAK[i]);
+  fscanf(pfd, "%d ", &numTFs);
+  fscanf(pfd, "%d ", &criticalBandModel);
+  fscanf(pfd, "%d\n", &freqBandWidth);
+  P("Number of spectral envelopes is %d\n\n", numTFs);	    /* jwb 06/07/08 */
+
+  if(criticalBandModel == 0) setupLinFreqBands();
+  else if(criticalBandModel == 1) setupCBFreqBands();
+  else
+  {
+    numFreqBands = freqBandWidth;
+    frBandmid = (float *) malloc((numFreqBands+1)*sizeof(float));
+    frBandmid[numFreqBands] = fs/2.0;			    /* jwb 08/14/08 */
+  P("Set up %d linear frequency bands\n\n", numFreqBands);  /* jwb 06/07/08 */
+  }
+
+/* redundant, but oh well */
+  for(j=0; j<numFreqBands; j++)
+    fscanf(pfd, "%f ", &frBandmid[j]);
+
+  /* set up transfer function amplitude vs. frequency 2D array */
+  specenv =
+    (float *)malloc((numTFs+1)*(numFreqBands)*sizeof(float)); /* a.z 08/17/18 */
+  for(i=1; i<=numTFs; i++)                          /* a.z 08/17/18 */
+  {
+    for(j=0; j<numFreqBands; j++)
+      fscanf(pfd, "%f ", &specenv[i*numFreqBands + j]);
+  }
+  fscanf(pfd, "%f", &CentMax);
+  fclose(pfd);
+} /* end tfRead() */
+
+/*****************************************************************************/
+void setupLinFreqBands()
+{
+  int i;
+
+
+  numFreqBands = fs/(freqBandWidth*2);			    /* jwb 08/14/08 */
+  P("Set up %d linear frequency bands\n\n", numFreqBands);  /* jwb 06/07/08 */
+  frBandmid = (float *) malloc((numFreqBands+1)*sizeof(float));
+  for(i=0; i<numFreqBands; i++)
+    frBandmid[i] = i*freqBandWidth;
+  frBandmid[numFreqBands] = fs/2.0;			    /* jwb 08/14/08 */
+}
+
+/*****************************************************************************/
+void setupCBFreqBands()
+{
+  int i;
+  float sum, fk;
+  numFreqBands = 24;
+  P("Set up %d critical frequency bands\n\n", numFreqBands);/* jwb 06/07/08 */
+  freqBandWidth = 0;
+  frBandmid = (float *) malloc((numFreqBands+1)*sizeof(float));
+  sum = 0.0;
+  for(i=0; i<numFreqBands; i++)
+  {
+    frBandmid[i] = sum;
+    fk = sum/1000.0;
+    sum += 25.0 + 75.0*pow(1.0 + 1.4*fk*fk,  0.69);
+  }
+  frBandmid[numFreqBands] = fs/2.0;			    /* jwb 08/14/08 */
+}
+
+/*****************************************************************************/
+void synthesizeTone(int sffd)
+{
+  int i, tf, k, kmax, parg, parg1;/* jwb 06/08/08 */
+  int fbno1, fbno2;					    /* jwb 06/09/08 */
+  float fr, frk, sum1, sum2, ampk;/* jwb 05/29/08 */
+  float fr1, fr2, specenv1, specenv2, frac;		    /* jwb 06/09/08 */
+  float cent, frfac;				    /* jwb 06/19/08 */
+  char resp[10], outanfile[100];			    /* jwb 06/01/08 */
+  float centroid_max,min_centroidtf_max;       /* a.z 08/17/18 */
+  /* Load freq array and find lowest and highest pitches of input signal. */
+  /* Also load centroid and rms arrays. */
+
+  P("Give fund. freq. transpose factor: ");		    /* jwb 06/19/08 */
+  scanf("%f%*c", &frfac);				    /* jwb 06/19/08 */
+  P("\n");						    /* jwb 06/19/08 */
+
+  freq = (float *) malloc(npts*sizeof(float));
+  centroid = (float *) malloc(npts*sizeof(float));
+  rms = (float *) malloc(npts*sizeof(float));
+
+
+/* load fund. freq., spectral centroid, and rms amp. and find
+   minimum and maximum frequencies of input analysis file */
+   centroid_max=0;
+  for(i=0; i<npts; i++)
+  {
+    freq[i] = frfac*(fa + dfr[i*nhar1]);		    /* jwb 06/19/08 */
+    if(freq[i] == 0.)		    /* a.z 08/27/18 */
+    {
+      centroid[i]=0.;		    /* a.z 08/27/18 */
+      rms[i]=0.;		    /* a.z 08/27/18 */
+      continue;		    /* a.z 08/27/18 */
+    }
+    //P("fs=%f\n",frBandmid[numFreqBands-1]);
+    int maxh=frBandmid[numFreqBands-1]/freq[i];		    /* a.z 08/27/18 */
+    int maxk=min(nhar,maxh);		    /* a.z 08/27/18 */
+
+
+    sum1=sum2=0.;		    /* a.z 08/27/18 */
+    float sum3=0;		    /* a.z 08/27/18 */
+    for(k=1;k<=maxk;k++)		    /* a.z 08/27/18 */
+    {
+      sum1+=k*cmag[i*nhar1+k];		    /* a.z 08/27/18 */
+      sum2+=cmag[i*nhar1+k];		    /* a.z 08/27/18 */
+      sum3+=cmag[i*nhar1+k]*cmag[i*nhar1+k];		    /* a.z 08/27/18 */
+    }
+
+    rms[i] = sqrt(sum3);		    /* a.z 08/27/18 */
+
+    centroid[i] = (sum1/sum2 - 1.)*freq[i];		    /* a.z 08/27/18 */
+    //P("centroid[%d]=%.2f\n",i,centroid[i]);
+    if(centroid[i]>centroid_max)centroid_max=centroid[i];                     /* a.z 08/17/18 */
+
+//P("centroid[%d]=%.2f\n",i,centroid[i]);
+  }
+  P("centroid_max=%.2f\n",centroid_max);                                        /* a.z 08/17/18 */
+
+
+/* For each semitone pitch compute the centroids for the spectra sampled
+   from the spectral envelopes */
+  centroidTF = (float *) malloc((1+numTFs)*sizeof(float));                      /* a.z 08/17/18 */
+  min_centroidtf_max=HUGEI;                                                     /* a.z 08/17/18 */
+
+  tfVal=(float*)malloc(npts*sizeof(float));
+  for(i=0; i<npts; i++)                                                         /* a.z 08/17/18 */
+  {
+    fr =freq[i] ;                                                               /* a.z 08/17/18 */
+    if(fr==0)continue;                                                          /* a.z 08/17/18 */
+    kmax = min(frBandmid[numFreqBands-1]/fr, nhar);	                            /* a.z 08/17/18 */
+    sum1 = sum2 = 0.;                                                           /* a.z 08/17/18 */
+    for(k=1; k<=kmax; k++)                                                      /* a.z 08/17/18 */
+    {
+      frk = fr*k;
+      fbno1 = fbandno(frk);				    /* jwb 06/09/08 */
+      fbno2 = fbno1 + 1;				    /* jwb 06/09/08 */
+      fr1 = frBandmid[fbno1];				    /* jwb 06/09/08 */
+      fr2 = frBandmid[fbno2];				    /* jwb 06/09/08 */
+      specenv1 = specenv[fbno1 + numTFs*numFreqBands];	    /* jwb 06/09/08 */
+      specenv2 = specenv[fbno2 + numTFs*numFreqBands];	    /* jwb 06/09/08 */
+      frac = (frk - fr1)/(fr2 - fr1);			    /* jwb 06/09/08 */
+      ampk = frac*specenv2 + (1. - frac)*specenv1;	    /* jwb 06/09/08 */
+      sum1 += k*ampk;					    /* jwb 06/08/08 */
+      sum2 += ampk;
+    }
+    cent = fr*(sum1/sum2 -1.);		    /* jwb 06/07/08 */
+    if(cent<min_centroidtf_max)                                                 /* a.z 08/17/18 */
+    {
+      min_centroidtf_max=cent;                                                  /* a.z 08/17/18 */
+    }
+  }
+
+     rescaleFac=1.;                                /* a.z 08/17/18 */
+
+       P("give centroid rescale factor (default: %.2f): ",rescaleFac);          /* a.z 08/17/18 */
+      fgets(buffer,BUFSIZE,stdin);                                              /* a.z 08/17/18 */
+      if(sscanf(buffer,"%f",&rescaleFac)!=1) ;                                  /* a.z 08/17/18 */
+      P("rescaleFac=%.2f\n",rescaleFac);                                        /* a.z 08/17/18 */
+      for(i=0;i<npts;i++)                                                       /* a.z 08/17/18 */
+      centroid[i]*=rescaleFac;                                                  /* a.z 08/17/18 */
+  
+  for(i=0; i<npts; i++)
+  {
+    fr =freq[i];                                                                /* a.z 08/17/18 */
+    if(fr==0)                                                                   /* a.z 08/17/18 */
+    {
+      tfVal[i]=0;continue;                                                      /* a.z 08/17/18 */
+    }
+    for(tf=1; tf<=numTFs; tf++)                                                 /* a.z 08/17/18 */
+    {
+      kmax = min(frBandmid[numFreqBands-1]/fr, nhar);	    /* jwb 06/07/08 */
+      sum1 = sum2 = 0.;                                                         /* a.z 08/17/18 */
+      for(k=1; k<=kmax; k++)
+      {
+        frk = fr*k;
+        fbno1 = fbandno(frk);				    /* jwb 06/09/08 */
+        fbno2 = fbno1 + 1;				    /* jwb 06/09/08 */
+        fr1 = frBandmid[fbno1];				    /* jwb 06/09/08 */
+        fr2 = frBandmid[fbno2];				    /* jwb 06/09/08 */
+        specenv1 = specenv[fbno1 + tf*numFreqBands];	    /* jwb 06/09/08 */
+        specenv2 = specenv[fbno2 + tf*numFreqBands];	    /* jwb 06/09/08 */
+        frac = (frk - fr1)/(fr2 - fr1);			    /* jwb 06/09/08 */
+        ampk = frac*specenv2 + (1. - frac)*specenv1;	    /* jwb 06/09/08 */
+        sum1 += k*ampk;					    /* jwb 06/08/08 */
+        sum2 += ampk;
+      }
+      cent = fr*(sum1/sum2 -1.);			    /* jwb 06/08/08 */
+      centroidTF[tf] = cent;		    /* jwb 06/07/08 */
+    }/* end for(tf */
+      centroidTF[0]=0;                                                          /* a.z 08/17/18 */
+
+    for(tf=0; tf<numTFs; tf++)
+    {
+      parg = tf;                                                                /* a.z 08/17/18 */
+      parg1 = parg + 1;                                                         /* a.z 08/17/18 */
+      if( centroid[i] <= centroidTF[parg1])
+      {
+        if(centroidTF[parg] >= centroidTF[parg1])
+          tfVal[i] = tf;
+        else
+          tfVal[i] = tf + (centroid[i] - centroidTF[parg])/
+			  (centroidTF[parg1] - centroidTF[parg]);
+        tfVal[i] = max(tfVal[i],(float)tf);
+        break;
+      }
+    } /* end for(tf */
+
+    if(tf >= numTFs)
+    {
+      tfVal[i] = numTFs - 0.0001;                                               /* a.z 08/17/18 */
+    }
+    /*if(i>9./16.376*npts && i<10./16.376*npts)
+    {
+      P("at %.2fs centroid=%.2f, tfVal=%.2f, centroidTF=%.2f\n",i*16.376/npts,centroid[i],tfVal[i],centroidTF[tf]);
+    }*/
+  } /* end for i */
+
+  /* create new harmonic amplitude arrays */
+   haramp();
+
+  /* write modified analysis data to file */
+  P("Write analysis data to file? (y or n): ");		    /* jwb 06/01/08 */
+  scanf("%s%*c", resp);					    /* jwb 06/01/08 */
+  if(resp[0]=='y')					    /* jwb 06/01/08 */
+  {							    /* jwb 06/01/08 */
+    P("Give name of output analysis file: ");		    /* jwb 05/30/08 */
+    scanf("%s%*c", outanfile);				    /* jwb 05/30/08 */
+    anwrite(outanfile);					    /* jwb 05/30/08 */
+  }							    /* jwb 06/01/08 */
+
+  /* do the additive synthesis */
+  addsynth(sffd);
+
+} /* end synthesizeTone() */
+
+/*****************************************************************************
+   For frequency fr find freq band number using linear search
+ ****************************************************************************/
+int fbandno(float fr)
+{
+  int fbno;
+
+  for(fbno=0; fbno<numFreqBands; fbno++)
+    if(fr<frBandmid[fbno+1]) return(fbno);
+  return(numFreqBands-1);
+}
+
+/*****************************************************************************
+  Based on fund. freq., tfVal, and rms amplitude as they vary with time,
+  compute the harmonic amplitudes as function of frame number.
+ ****************************************************************************/
+void haramp()
+{
+  int i, k, kk, tf, narg0, fbno, sarg, sarg1, sargmax;	    /* jwb 06/02/08 */
+  float tffrac, ffrac, sum, frk, f0, f1;		    /* jwb 06/07/08 */
+  float A11, A21, A12, A22, A1, A2, Ak, ampfac;
+  float *rmsTF;
+
+  sargmax = numTFs*numFreqBands;
+
+  rmsTF = (float *) malloc(npts*sizeof(float));
+  for(i=0; i<npts; i++)
+  {
+    tf = tfVal[i];
+    tffrac = tfVal[i] - tf;				    /* jwb 06/07/08 */
+    narg0 = i*nhar1;
+    sum = 0.;
+
+   /*if freq[i]=0, set cmag to be zero for all harmonics */
+    if(freq[i]==0)                 /* a.z 08/21/18 */
+    {
+      for(k=1; k<=nhar; k++)
+      {
+      cmag[k+narg0]=0;
+      }
+    continue;
+    }
+    /*create a spectral envelope which has centroid=0 for freq[i]*/
+    if(tf==0)                                                                   /* a.z 08/17/18 */
+    {
+      fbno=fbandno(freq[i]);
+      specenv[fbno]=1;specenv[fbno+1]=1;
+      int fb;
+      for(fb=fbno+2;fb<numFreqBands;fb++)specenv[fb]=0;
+    }
+
+  /* sample the spectral envelopes (TFs) at harmonic frequencies */
+    for(k=1; k<=nhar; k++)
+    {
+      frk = k*freq[i];                                                          /* a.z 08/17/18 */
+      if(frk >= frBandmid[numFreqBands-1])
+      {
+       for(kk=k; kk<=nhar; kk++)
+        cmag[kk+narg0] = 0.; 	    /* jwb 06/02/08 */
+       break;
+      }
+      fbno = fbandno(frk);
+      f0 = frBandmid[fbno];
+      f1 = frBandmid[fbno+1];
+      ffrac = (frk-f0)/(f1-f0);				    /* jwb 06/07/08 */
+      sarg = fbno + tf*numFreqBands;
+
+/* eliminate the possibility that high harmonics get garbage */
+      if(sarg > sargmax) { P("haramp(): sargmax exceeded\n"); sarg = sargmax;}
+      sarg1 = sarg + numFreqBands;
+
+  /* frequency interpolation for spec envelope number tf */
+      A11 = specenv[sarg];
+      A12 = specenv[sarg + 1];
+      A1 = A11 + (A12-A11)*ffrac;			    /* jwb 06/07/08 */
+
+      /* when 0<frk<frBandmid[0] */
+      if(frk<f0)                                                                /* a.z 08/17/18 */
+      {
+        f1=frBandmid[fbno];                                                     /* a.z 08/17/18 */
+        ffrac=frk/f1;                                                           /* a.z 08/17/18 */
+        A1=ffrac*A11;                                                           /* a.z 08/17/18 */
+      }
+  /* frequency interpolation for spec envelope number tf+1 */
+      A21 = specenv[sarg1];
+      A22 = specenv[sarg1 + 1];
+      A2 = A21 + (A22-A21)*ffrac;			    /* jwb 06/07/08 */
+      /* when 0<frk<frBandmid[0] */
+      if(frk<f0)                                                                /* a.z 08/17/18 */
+      {
+        f1=frBandmid[0];                                                        /* a.z 08/17/18 */
+        ffrac=frk/f1;                                                           /* a.z 08/17/18 */
+        A2=ffrac*A21;                                                           /* a.z 08/17/18 */
+      }
+  /* spec envelope interpolation between tf and tf+1 */
+
+      Ak = max(A1 + (A2-A1)*tffrac,0.);			    /* jwb 06/07/08 */
+
+
+      sum += Ak*Ak;
+      cmag[k+narg0] = Ak;
+    } /* end for(k */
+  /* match original rms amplitude */
+    if(sum > 0.)
+    {
+      ampfac = rms[i]/sqrt(sum);
+      for(k=1; k<=nhar; k++) cmag[k+narg0] *= ampfac;
+    }
+    else for(k=1; k<=nhar; k++) cmag[k+narg0] = 0.;	    /* jwb 06/01/08 */
+  } /* end for(i */
+} /* end haramp() */
+
+/*****************************************************************************
+	additive synthesis based on time-varying harmonic amplitudes and
+        time-varying fundamental frequency written to output sound file.
+ ****************************************************************************/
+void addsynth(int sffd)
+{
+  int i, j, k, narg1, narg2, nosamps, nargmax, nhmax;	    /* jwb 06/01/08 */
+  short int *samp;
+  float phfac, phs, *sinetab, phasek, *phase, st, t, tm, tmp;
+  float sifac, si, fj, frac1, frac2, sum, ckj, fs2, fr;	    /* jwb 06/01/08 */
+
+  /* Load sine table */
+  phfac = 8.*atan(1.)/FUN_LENGTH;
+  sinetab = (float *) malloc((FUN_LENGTH+1)*sizeof(float));
+  for(j=0; j<=FUN_LENGTH; j++)
+  {
+    phs = phfac*j;
+    sinetab[j] = sin(phs);
+  }
+
+  /* allocate space for entire sound */
+  nosamps = tl*fs;					    /* jwb 08/14/08 */
+  samp = (short *) malloc(nosamps*sizeof(short));
+
+/* SND or WAV header has already been written in main program */
+
+  /* Do the additive synthesis */
+  sifac = FUN_LENGTH/fs;				    /* jwb 08/14/08 */
+  phase = (float *) malloc(nhar1*sizeof(float));
+  for(k=0; k<=nhar; k++) phase[k] = 0.;
+  st = 1./fs; t = 0.;					    /* jwb 08/14/08 */
+  nargmax = npts*nhar1 -1;
+  fs2 = 0.5*fs;						    /* jwb 08/14/08 */
+
+  for(i=0; i<nosamps; i++)
+  {
+    /*  find frame number j */
+    fj = t/dt; j = fj;  frac2 = fj - j;  frac1 = 1. - frac2;
+    narg1 = j*nhar1;  narg2 = (j+1)*nhar1;
+    if((j+1) > (npts-1))
+    {							    /* jwb 06/01/08 */
+      nosamps = i;					    /* jwb 06/01/08 */
+      break;
+    }							    /* jwb 06/01/08 */
+    sum = 0.;
+    fr = frac1*freq[j] + frac2*freq[j+1];		    /* jwb 06/01/08 */
+    si = sifac*fr;					    /* jwb 06/01/08 */
+    if(fr > 0.)						    /* jwb 06/01/08 */
+    {							    /* jwb 06/01/08 */
+      nhmax = min(nhar, (int)fs2/fr);			    /* jwb 06/01/08 */
+      for(k=1; k <= nhmax; k++)				    /* jwb 06/01/08 */
+      {
+        narg1++;  narg2++;
+        phasek = amod(phase[k], (float)FUN_LENGTH);
+        if(phasek < 0.) phasek += (float)FUN_LENGTH;
+        ckj = frac1*cmag[narg1] + frac2*cmag[narg2];
+
+        sum += ckj*sinetab[(int)phasek];
+          /* save for next sample i:  */
+        phase[k] = phasek + k*si;
+      }
+    }
+    samp[i] = sum;
+    tm = amod(t, .1);
+    if (tm < tmp) {P( "%.2f  ",t); fflush(stdout);}
+    tmp = tm;
+    t += st;
+  } /* end for(i */
+  P("\n");
+  if(byte_reverse)					    /* jwb 07/11/08 */
+  {							    /* jwb 07/11/08 */
+    for(i=0; i<nosamps; i++)				    /* jwb 07/11/08 */
+       byteswap2(samp+i);				    /* jwb 07/11/08 */
+  }							    /* jwb 07/11/08 */
+  write(sffd,samp,nosamps*sizeof(short));
+  free(samp);						    /* jwb 06/01/08 */
+} /* end addsynth() */
+
+int getfiltype(char *name) 				    /* jwb 08/14/08 */
+{ int i, len;						    /* jwb 08/14/08 */
+  len = strlen(name);					    /* jwb 08/14/08 */
+  for(i=0;i<MAXFTYPES;i++)				    /* jwb 08/14/08 */
+  {							    /* jwb 08/14/08 */
+    if(!strcmp(&name[len-3],tail[i])) return(i);	    /* jwb 08/14/08 */
+  }							    /* jwb 08/14/08 */
+  return(MAXFTYPES);					    /* jwb 08/14/08 */
+}							    /* jwb 08/14/08 */
+
+getout()                                                    /* jwb 08/14/08 */
+{                                                           /* jwb 08/14/08 */
+  int i;                                                    /* jwb 08/14/08 */
+  P("Sorry, only ");                                        /* jwb 08/14/08 */
+  for(i=0;i<MAXFTYPES-1;i++) P("%s, ", tail[i]);            /* jwb 08/14/08 */
+  P("and %s extensions are supported\n", tail[MAXFTYPES-1]);/* jwb 08/14/08 */
+  exit(-1);                                                 /* jwb 08/14/08 */
+}                                                           /* jwb 08/14/08 */
+
+/****** end tfsynth.fa0.c ******/
