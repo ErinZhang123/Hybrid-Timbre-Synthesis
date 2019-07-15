@@ -13,7 +13,7 @@ input: sax_original.wav&trumpet.tf
 
 output: sax2trumpet.wav
 
-raw code: tfsynth (based on sndan in Prof. James Beauchamp's CMP Lab in UIUC, to install sndan program, send email to 13333312299@163.com)
+raw code: tfsynth_ailin (based on sndan in Prof. James Beauchamp's CMP Lab in UIUC, to install sndan program, send email to 13333312299@163.com)
 
 Hybrid Timbre Synthesis (details in HTS.pdf)
 
