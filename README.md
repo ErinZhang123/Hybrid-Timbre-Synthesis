@@ -14,9 +14,14 @@ raw code: tfsynth (based on sndan in Prof. James Beauchamp's CMP Lab in UIUC, to
 Hybrid Timbre Synthesis (details in HTS.pdf)
 
 Example
+
 ●	program command: tfsynth.fa0
+
 ●	input: transfer function(spectral envelope) data--trumpet.tf
+
        input signal analysis file--leonard.16.nik.mq.an
+       
 ●	output: resynthesized sound signal--leonard.test.wav
-resynthesized analysis file(optional)--leonard.test.an
+
+      resynthesized analysis file(optional)--leonard.test.an
 
